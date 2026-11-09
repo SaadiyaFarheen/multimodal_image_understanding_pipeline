@@ -1,43 +1,53 @@
+"""Image classification with a pretrained ResNet50 (ImageNet, 1000 classes).
+
+Note: ResNet50 here is a *single-label* classifier (softmax over 1000 classes).
+We return the top-k most likely classes that pass a confidence threshold.
+It is NOT a multi-label model.
+"""
+from functools import lru_cache
+
 import torch
-from torchvision import models, transforms
 from PIL import Image
-import urllib.request
-from caption import generate_caption
+from torchvision import models
 
-# Load pretrained model
-model = models.resnet50(pretrained=True)
-model.eval()
 
-# Load ImageNet labels
-LABELS_URL = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-classes = urllib.request.urlopen(LABELS_URL).read().decode("utf-8").splitlines()
+@lru_cache(maxsize=1)
+def get_classifier(pretrained: bool = True):
+    """Load ResNet50 once and reuse it (lazy: nothing is loaded at import time)."""
+    weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+    model = models.resnet50(weights=weights)
+    model.eval()
 
-# Image transform
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])
+    # The official preprocessing for these weights: resize 232 -> center-crop 224
+    # -> convert to tensor -> normalise with ImageNet mean/std.
+    preprocess = models.ResNet50_Weights.DEFAULT.transforms()
+    # Class names ship with torchvision, so no network call is needed.
+    classes = models.ResNet50_Weights.DEFAULT.meta["categories"]
+    return model, preprocess, classes
 
-def predict_image(image_path):
-    image = Image.open(image_path).convert("RGB")
-    image = transform(image).unsqueeze(0)
 
+def predict_image(image: Image.Image, top_k: int = 3, threshold: float = 0.05,
+                  pretrained: bool = True):
+    """Return up to `top_k` [{"label", "confidence"}] with confidence >= threshold.
+
+    If NOTHING reaches the threshold (e.g. a photo of a person: ImageNet has no
+    "person" class, so the probability is spread over many unrelated classes),
+    return the single best guess marked "low_confidence": True instead of an
+    empty list, so the caller still gets an answer and knows not to trust it.
+    """
+    model, preprocess, classes = get_classifier(pretrained)
+
+    batch = preprocess(image.convert("RGB")).unsqueeze(0)  # shape: (1, 3, 224, 224)
     with torch.no_grad():
-        outputs = model(image)
+        logits = model(batch)
 
-    probs = torch.nn.functional.softmax(outputs[0], dim=0)
-    top3 = torch.topk(probs, 3)
+    probs = torch.softmax(logits[0], dim=0)
+    top = torch.topk(probs, top_k)
 
-    labels = [classes[i] for i in top3.indices.tolist()]
-    return labels
-
-# TEST
-if __name__ == "__main__":
-    result = predict_image("test.jpg")
-    print("Predicted labels:", result)
-
-labels = predict_image("test.jpg")
-print("Predicted labels:", labels)
-
-caption = generate_caption("test.jpg")
-print("Caption:", caption)
+    pairs = list(zip(top.values.tolist(), top.indices.tolist()))
+    results = [{"label": classes[idx], "confidence": round(p, 4)}
+               for p, idx in pairs if p >= threshold]
+    if not results:
+        p, idx = pairs[0]
+        results = [{"label": classes[idx], "confidence": round(p, 4), "low_confidence": True}]
+    return results
